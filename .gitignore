@@ -1,0 +1,19 @@
+node_modules/
+
+# PST and ZIP archives
+*.pst
+*.zip
+
+# PDF files
+*.pdf
+
+# Output directories
+output/
+output copy/
+output copy */
+output_delivered/
+
+.env
+.DS_Store
+.vscode/
+.npm-cache/
