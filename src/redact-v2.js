@@ -19,25 +19,24 @@ const path = require("path");
 const OpenAI = require("openai");
 
 // Paths
-const INPUT_PATH = path.resolve(
-  __dirname,
-  "..",
-  "output",
-  "extracted-messages.json",
-);
-const OUTPUT_PATH = path.resolve(
-  __dirname,
-  "..",
-  "output",
-  "redacted-messages.json",
-);
-const CHECKPOINT_PATH = path.resolve(
-  __dirname,
-  "..",
-  "output",
-  "redaction-checkpoint-v2.json",
-);
-const AUDIT_PATH = path.resolve(__dirname, "..", "output", "audit-log.json");
+const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
+const AUDIT_PATH = path.join(OUTPUT_DIR, "audit-log.json");
+
+// Optional: use a different input file (e.g. filtered-messages.json)
+// Example: REDACT_INPUT=output/filtered-messages.json npm run redact
+const _inputOverride = process.env.REDACT_INPUT;
+const INPUT_PATH = _inputOverride
+  ? path.resolve(process.cwd(), _inputOverride)
+  : path.join(OUTPUT_DIR, "extracted-messages.json");
+const _inputBasename = _inputOverride
+  ? path.basename(path.resolve(process.cwd(), _inputOverride), ".json")
+  : null;
+const OUTPUT_PATH = _inputBasename
+  ? path.join(OUTPUT_DIR, `redacted-${_inputBasename}.json`)
+  : path.join(OUTPUT_DIR, "redacted-messages.json");
+const CHECKPOINT_PATH = _inputBasename
+  ? path.join(OUTPUT_DIR, `redaction-checkpoint-v2-${_inputBasename}.json`)
+  : path.join(OUTPUT_DIR, "redaction-checkpoint-v2.json");
 
 // Configuration
 const MODEL = "gpt-4.1-mini"; // Mini is sufficient - deterministic stages do the heavy lifting
@@ -329,6 +328,31 @@ const COMMON_WORDS = new Set([
   "llc",
   "corp",
   "corporation",
+  // Verbs / common words often wrongly suggested as names
+  "manage",
+  "clear",
+  "be",
+  "list",
+  "meet",
+  "process",
+  "goal",
+  "help",
+  "need",
+  "get",
+  "see",
+  "come",
+  "make",
+  "take",
+  "follow",
+  "deliver",
+  "detail",
+  "change",
+  "negative",
+  "organising",
+  "organizing",
+  "specific",
+  "useful",
+  "complicated",
   // Other
   "the",
   "and",
@@ -540,27 +564,40 @@ function buildAIPrompt(messages) {
   }));
 
   return {
-    system: `You are a GDPR compliance assistant. Your task is to identify ALL remaining personal names and company names in message text that need redaction.
+    system: `You are a UK GDPR / DSAR compliance assistant. Your task is to identify third-party PERSONAL NAMES (people only) in message text that should be redacted under DSAR guidance. Aim for a balanced approach: redact names that identify other individuals, but do NOT redact common English words or every company name.
 
-DATA SUBJECT (DO NOT REDACT): ${DATA_SUBJECT.name} (${DATA_SUBJECT.email})
-Also keep: "John", "Gaskell", "J. Gaskell"
+*** CRITICAL - DATA SUBJECT: NEVER REDACT THE DATA SUBJECT ***
+The person who made this data request (the "data subject") must NEVER appear in your redaction list.
+
+DATA SUBJECT - DO NOT REDACT (case-insensitive, any variation):
+- Full name: ${DATA_SUBJECT.name}
+- Email: ${DATA_SUBJECT.email}
+- First name only: John | Last name only: Gaskell
+- Variants: J. Gaskell, J Gaskell, Mr Gaskell, Mr. Gaskell
+
+*** DO NOT REDACT COMMON ENGLISH WORDS ***
+Only suggest strings that are clearly PERSONAL NAMES (people). Do NOT suggest:
+- Verbs: manage, clear, be, meet, get, make, take, see, come, help, need, follow, deliver, etc.
+- Articles/prepositions: the, a, from, to, for, with, by, etc.
+- Common nouns: list, team, process, goal, detail, change, etc.
+- Job titles alone: Manager, Director, Head (unless part of a full name like "Mark Stephens, Director" — redact "Mark Stephens" only).
+
+WHAT TO REDACT (UK DSAR – data about other individuals):
+- Third-party personal names: full names or first/last names of OTHER people (e.g. "Sarah Smith", "Aneta Misztal", "Jennifer Sharpe"). These identify or link to other individuals and should be redacted.
+- Names in greetings: "Hi Aneta", "Dear Jason" → suggest only the person's name (e.g. "Aneta", "Jason"), not "Hi" or "Dear".
+- Names in signatures / sign-offs: "Kind Regards, Megan", "Thanks, Sarah" → suggest only the name (e.g. "Megan", "Sarah").
+- Standalone names on a line (e.g. signature block): "Hayley Myers", "Nicola" — but only if they are clearly a person's name, not a common word.
+- Names in parentheses when they refer to a person: "(Sean)", "(Monika)" — but NOT "(John)" or "(John Gaskell)" (data subject).
+
+WHAT NOT TO REDACT:
+- The data subject: ${DATA_SUBJECT.name}, John, Gaskell, ${DATA_SUBJECT.email}.
+- Common words that happen to be capitalized: "Manage", "Clear", "Be", "List", "Process", "Team", "Goal".
+- Company or organization names unless the context is clearly confidential commercial/legal (e.g. trade secrets, ongoing negotiations, legal advice). Routine mentions of suppliers, carriers, or partners (e.g. "Stena Line", "Condor Ferries") do NOT need to be suggested for redaction in this pass.
+- Job titles or role names alone (Manager, Director, Head of CS).
 
 ALREADY REDACTED: Text marked as [REDACTED ...] should be ignored.
 
-IDENTIFY AND RETURN:
-1. NAMES: Any person's name (first name, last name, or full name) that is NOT the data subject
-   - Full names: "Sarah Smith", "Hayley Myers", "John Smith"
-   - First names alone: "Sarah", "Nicola", "Romey", "Megan"
-   - Names in greetings: "Hi Romey", "Dear Jason"
-   - Names in signatures: "Kind Regards, Megan", "Thanks, Sarah"
-   - Standalone names on their own line: "Hayley Myers" (on a line by itself)
-   - Names in parentheses: "(Sean)", "(John Smith)"
-   - Names with titles: "Mr. Smith", "Dr. Williams"
-   - CRITICAL: If you see a capitalized word that could be a name (especially at start of line or after newline), redact it
-
-2. COMPANIES: Any company or organization name
-   - Examples: "DHL", "Walkers Transport", "Primeline Express", "Haldane Fisher Ltd"
-   - Include company names with suffixes: Ltd, Inc, Corp, PLC, LLC
+When in doubt, do NOT include an item — prefer missing a borderline name over redacting a common word. Only suggest strings you are confident are personal names of other people.
 
 RESPONSE FORMAT (JSON only, no markdown):
 {
@@ -568,16 +605,17 @@ RESPONSE FORMAT (JSON only, no markdown):
     {
       "messageId": <number>,
       "items": [
-        {"text": "<exact text to redact>", "type": "name|company"}
+        {"text": "<exact text to redact>", "type": "name"}
       ]
     }
   ]
 }
 
-Be EXTREMELY thorough. False positives are preferred over false negatives.`,
+Return only "name" type. Do NOT include the data subject (${DATA_SUBJECT.name}, John, Gaskell, ${DATA_SUBJECT.email}) in your redaction list.`,
 
-    user: `Analyze these messages and identify ALL names and company names to redact:
+    user: `Analyze these messages and identify third-party personal names (people only) to redact. Do NOT suggest common English words or company names unless clearly confidential. Do NOT suggest the data subject (${DATA_SUBJECT.name}, John, Gaskell, ${DATA_SUBJECT.email}).
 
+Messages:
 ${JSON.stringify(messagesData, null, 2)}`,
   };
 }

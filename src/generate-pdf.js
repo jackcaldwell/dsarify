@@ -2,13 +2,12 @@ const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
 
-const INPUT_PATH = path.resolve(
-  __dirname,
-  "..",
-  "output",
-  "redacted-messages.json"
-);
+// Optional: use a different input file (e.g. redacted-filtered-messages.json)
+// Example: PDF_INPUT=output/redacted-filtered-messages.json npm run pdf
 const OUTPUT_DIR = path.resolve(__dirname, "..", "output");
+const INPUT_PATH = process.env.PDF_INPUT
+  ? path.resolve(process.cwd(), process.env.PDF_INPUT)
+  : path.join(OUTPUT_DIR, "redacted-messages.json");
 
 // Page dimensions and margins
 const PAGE_MARGIN = 50;
@@ -84,20 +83,19 @@ function truncateText(text, maxLength = 5000) {
 }
 
 /**
- * Create a safe filename from source file name
+ * Create a safe filename from a base name (e.g. source file or input basename)
  */
-function createSafeFilename(sourceFile) {
-  // Remove .pst extension and replace unsafe characters
-  const baseName = sourceFile
+function createSafeFilename(baseName) {
+  const safe = String(baseName)
     .replace(/\.pst$/i, "")
     .replace(/[^a-zA-Z0-9_-]/g, "_");
-  return `dsar-${baseName}.pdf`;
+  return `dsar-${safe}.pdf`;
 }
 
 /**
- * Add the cover page for a specific source file
+ * Add the cover page
  */
-function addCoverPage(doc, sourceFile, messages, metadata) {
+function addCoverPage(doc, documentTitle, messages, metadata) {
   doc.fontSize(24).font("Helvetica-Bold").text("DATA SUBJECT ACCESS REQUEST", {
     align: "center",
   });
@@ -117,11 +115,11 @@ function addCoverPage(doc, sourceFile, messages, metadata) {
 
   doc.moveDown(1);
 
-  // Source file info
-  doc.font("Helvetica-Bold").text("Source File:");
+  // Document info
+  doc.font("Helvetica-Bold").text("Document:");
   doc.font("Helvetica");
-  doc.text(sourceFile);
-  doc.text(`Messages in this file: ${messages.length.toLocaleString()}`);
+  doc.text(documentTitle);
+  doc.text(`Total messages: ${messages.length.toLocaleString()}`);
 
   doc.moveDown(1);
 
@@ -249,11 +247,11 @@ function addMessage(doc, msg, index, total) {
 // Page numbers / header removed - was appearing on blank pages and isn't essential
 
 /**
- * Generate a single PDF for a source file
+ * Generate a single PDF with all messages
  */
-function generatePdfForSource(sourceFile, messages, metadata) {
+function generatePdfDocument(documentTitle, outputFilename, messages, metadata) {
   return new Promise((resolve, reject) => {
-    const outputPath = path.join(OUTPUT_DIR, createSafeFilename(sourceFile));
+    const outputPath = path.join(OUTPUT_DIR, outputFilename);
 
     const doc = new PDFDocument({
       size: "A4",
@@ -265,7 +263,7 @@ function generatePdfForSource(sourceFile, messages, metadata) {
       },
       bufferPages: true,
       info: {
-        Title: `DSAR Response - ${DATA_SUBJECT.name} - ${sourceFile}`,
+        Title: `DSAR Response - ${DATA_SUBJECT.name}`,
         Author: "Freightlink",
         Subject: "Data Subject Access Request Response",
         Keywords: "DSAR, GDPR, UK GDPR, Data Protection",
@@ -276,7 +274,7 @@ function generatePdfForSource(sourceFile, messages, metadata) {
     doc.pipe(stream);
 
     // Cover page
-    addCoverPage(doc, sourceFile, messages, metadata);
+    addCoverPage(doc, documentTitle, messages, metadata);
 
     // Messages (only add content page if there are messages)
     const total = messages.length;
@@ -295,64 +293,52 @@ function generatePdfForSource(sourceFile, messages, metadata) {
 }
 
 /**
- * Main PDF generation function - generates multiple PDFs by source file
+ * Sort messages by date ascending (null/missing dates last)
+ */
+function sortByDateAscending(messages) {
+  return [...messages].sort((a, b) => {
+    const dateA = a.date ? new Date(a.date).getTime() : Infinity;
+    const dateB = b.date ? new Date(b.date).getTime() : Infinity;
+    return dateA - dateB;
+  });
+}
+
+/**
+ * Main PDF generation function - one PDF with all messages, sorted by date
  */
 async function generatePdf() {
   console.log("=".repeat(60));
-  console.log("PHASE 3: GENERATING PDFs BY SOURCE FILE");
+  console.log("PHASE 3: GENERATING PDF");
   console.log("=".repeat(60));
   console.log(`\nInput: ${INPUT_PATH}`);
   console.log(`Output directory: ${OUTPUT_DIR}\n`);
 
   // Load redacted messages
   const data = JSON.parse(fs.readFileSync(INPUT_PATH, "utf-8"));
-  console.log(
-    `Loaded ${data.messages.length.toLocaleString()} redacted messages`
+  const messages = data.messages || [];
+  console.log(`Loaded ${messages.length.toLocaleString()} redacted messages`);
+
+  // Sort all messages by date ascending
+  const sortedMessages = sortByDateAscending(messages);
+  const documentTitle = path.basename(INPUT_PATH, ".json");
+  const outputFilename = createSafeFilename(documentTitle);
+
+  console.log(`\nGenerating single PDF (messages sorted by date ascending)...`);
+  const outputPath = await generatePdfDocument(
+    documentTitle,
+    outputFilename,
+    sortedMessages,
+    data.metadata
   );
 
-  // Group messages by source file
-  const messagesBySource = new Map();
-  for (const msg of data.messages) {
-    const source = msg.sourceFile || "unknown";
-    if (!messagesBySource.has(source)) {
-      messagesBySource.set(source, []);
-    }
-    messagesBySource.get(source).push(msg);
-  }
-
-  console.log(`\nFound ${messagesBySource.size} source files:`);
-  for (const [source, msgs] of messagesBySource) {
-    console.log(`  - ${source}: ${msgs.length.toLocaleString()} messages`);
-  }
-
-  // Generate PDF for each source file
-  console.log("\nGenerating PDFs...");
-  const generatedFiles = [];
-
-  for (const [source, messages] of messagesBySource) {
-    console.log(
-      `  Processing: ${source} (${messages.length.toLocaleString()} messages)...`
-    );
-    const outputPath = await generatePdfForSource(
-      source,
-      messages,
-      data.metadata
-    );
-    generatedFiles.push(outputPath);
-    console.log(`    ✓ Created: ${path.basename(outputPath)}`);
-  }
-
+  const stats = fs.statSync(outputPath);
+  const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
   console.log(`\n${"=".repeat(60)}`);
   console.log("PDF GENERATION COMPLETE");
-  console.log(`  Generated ${generatedFiles.length} PDF files:`);
-  for (const file of generatedFiles) {
-    const stats = fs.statSync(file);
-    const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
-    console.log(`    - ${path.basename(file)} (${sizeMB} MB)`);
-  }
+  console.log(`  Created: ${path.basename(outputPath)} (${sizeMB} MB)`);
   console.log("=".repeat(60));
 
-  return generatedFiles;
+  return [outputPath];
 }
 
 // Run if called directly

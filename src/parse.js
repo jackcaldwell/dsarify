@@ -7,17 +7,72 @@ const OUTPUT_PATH = path.resolve(
   __dirname,
   "..",
   "output",
-  "extracted-messages.json",
+  "extracted-messages.json"
 );
 
-// PST files to process
-const PST_FILES = [
-  // "john_all_business_1.pst",
-  // "john_all_business_2.pst",
-  // "john_received_emails.pst",
-  // "john_sent_teams.pst",
-  "john@freightlink.co.uk.001.pst",
-];
+// PST export directories (from MS Purview exports under pst/)
+const PST_ROOT = path.resolve(__dirname, "..", "pst");
+const PST_EXPORT_DIRS = ["Exchange", "Exchange 2", "Exchange 3"];
+
+/**
+ * Recursively find all .pst files under a directory
+ */
+function findPstFiles(dir, baseDir = dir) {
+  const results = [];
+  if (!fs.existsSync(dir)) return results;
+
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const ent of entries) {
+    const fullPath = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      results.push(...findPstFiles(fullPath, baseDir));
+    } else if (ent.isFile() && ent.name.toLowerCase().endsWith(".pst")) {
+      results.push(fullPath);
+    }
+  }
+  return results;
+}
+
+/**
+ * Collect all PST file paths from the configured export directories
+ */
+function getPstFilesToProcess() {
+  const pstPaths = [];
+  for (const exportDir of PST_EXPORT_DIRS) {
+    const dirPath = path.join(PST_ROOT, exportDir);
+    const found = findPstFiles(dirPath);
+    pstPaths.push(...found);
+  }
+  return pstPaths;
+}
+
+/**
+ * Trim reply threads from message body.
+ * Keeps only the first/current message, removes quoted replies.
+ * Same logic as redact-v2.js so extracted data is consistent.
+ */
+function trimReplyThreads(body) {
+  if (!body) return body;
+
+  const separators = [
+    /\n-{20,}\n/, // ----------------------------------------
+    /\n_{20,}\n/, // ____________________
+    /\n={20,}\n/, // ====================
+    /\nFrom:.*?\nSent:.*?\nTo:/s, // Outlook-style header block
+    /\n>.*?wrote:/i, // Gmail-style "> On ... wrote:"
+    /\nOn\s+\d{1,2}[\s\/\-]\w+[\s\/\-]\d{2,4}.*?wrote:/i, // "On 15 July 2024... wrote:"
+    /\n-{3,}\s*Original Message\s*-{3,}/i, // --- Original Message ---
+  ];
+
+  let trimmed = body;
+  for (const sep of separators) {
+    const match = trimmed.match(sep);
+    if (match && match.index !== undefined && match.index > 50) {
+      trimmed = trimmed.substring(0, match.index).trim();
+    }
+  }
+  return trimmed;
+}
 
 /**
  * Convert HTML body to plain text
@@ -82,6 +137,8 @@ function extractMessageData(email, index, sourceFile) {
     bodySource = "topic";
   }
 
+  body = trimReplyThreads(body);
+
   return {
     id: index,
     sourceFile: sourceFile,
@@ -115,7 +172,7 @@ function processFolder(
   sourceFile,
   globalIndex,
   progress,
-  errors = [],
+  errors = []
 ) {
   const folderName = folder.displayName || "Root";
 
@@ -130,7 +187,7 @@ function processFolder(
           sourceFile,
           globalIndex,
           progress,
-          errors,
+          errors
         );
       }
     } catch (err) {
@@ -152,7 +209,7 @@ function processFolder(
           const msgData = extractMessageData(
             email,
             globalIndex.value,
-            sourceFile,
+            sourceFile
           );
           msgData.folder = folderName;
           messages.push(msgData);
@@ -163,8 +220,8 @@ function processFolder(
             const rate = messages.length / elapsed;
             console.log(
               `  [${sourceFile}] Extracted ${messages.length.toLocaleString()} messages (${rate.toFixed(
-                0,
-              )}/sec)`,
+                0
+              )}/sec)`
             );
           }
         }
@@ -178,7 +235,7 @@ function processFolder(
         error: err.message,
       });
       console.log(
-        `  WARNING: Skipped ${folder.contentCount} items in "${folderName}" (corrupted index)`,
+        `  WARNING: Skipped ${folder.contentCount} items in "${folderName}" (corrupted index)`
       );
     }
   }
@@ -207,7 +264,7 @@ function processPstFile(pstPath, messages, globalIndex, progress) {
       filename,
       globalIndex,
       progress,
-      errors,
+      errors
     );
 
     const addedCount = messages.length - beforeCount;
@@ -220,7 +277,7 @@ function processPstFile(pstPath, messages, globalIndex, progress) {
     console.log(`  -> Added ${addedCount.toLocaleString()} messages`);
     if (skippedItems > 0) {
       console.log(
-        `  -> Skipped ${skippedItems.toLocaleString()} items (corrupted folders)`,
+        `  -> Skipped ${skippedItems.toLocaleString()} items (corrupted folders)`
       );
     }
 
@@ -244,13 +301,12 @@ function parse() {
   console.log("PHASE 1: PARSING PST FILES");
   console.log("=".repeat(60));
 
-  const rootDir = path.resolve(__dirname, "..");
-  const availableFiles = PST_FILES.filter((f) =>
-    fs.existsSync(path.join(rootDir, f)),
-  );
+  const pstPaths = getPstFilesToProcess();
 
-  console.log(`\nFound ${availableFiles.length} PST files to process:`);
-  availableFiles.forEach((f) => console.log(`  - ${f}`));
+  console.log(`\nScanning: ${PST_ROOT}`);
+  console.log(`  Export dirs: ${PST_EXPORT_DIRS.join(", ")}`);
+  console.log(`\nFound ${pstPaths.length} PST files to process:`);
+  pstPaths.forEach((p) => console.log(`  - ${path.relative(PST_ROOT, p)}`));
   console.log(`\nOutput: ${OUTPUT_PATH}`);
 
   const messages = [];
@@ -258,10 +314,10 @@ function parse() {
   const progress = { startTime: Date.now() };
   const fileSummaries = [];
 
-  for (const pstFile of availableFiles) {
-    const pstPath = path.join(rootDir, pstFile);
+  for (const pstPath of pstPaths) {
+    const filename = path.basename(pstPath);
     const summary = processPstFile(pstPath, messages, globalIndex, progress);
-    fileSummaries.push({ file: pstFile, ...summary });
+    fileSummaries.push({ file: filename, path: pstPath, ...summary });
   }
 
   // Build metadata
